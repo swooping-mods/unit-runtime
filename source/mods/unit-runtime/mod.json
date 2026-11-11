@@ -1,0 +1,29 @@
+{
+  "id": "unit-runtime",
+  "kind": "native",
+  "version": "0.2.0",
+  "feature_dependencies": [],
+  "gameplay": true,
+  "display_name": "Moving Unit Runtime",
+  "provides": {
+    "unit-runtime.units": {
+      "abi": 1,
+      "size": 80,
+      "limits": {
+        "max_units": 2048,
+        "max_providers": 8
+      }
+    },
+    "unit-runtime.contacts": {
+      "abi": 1,
+      "size": 16,
+      "limits": {
+        "max_units": 2048
+      }
+    },
+    "unit-runtime.sources": {
+      "abi": 1,
+      "size": 48
+    }
+  }
+}

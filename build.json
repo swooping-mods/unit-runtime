@@ -1,0 +1,6 @@
+{
+  "schema": "moon-independent-build-spec/v1",
+  "id": "unit-runtime",
+  "kind": "native",
+  "entry": "mods/unit-runtime/mod.c"
+}
