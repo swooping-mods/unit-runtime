@@ -1,5 +1,7 @@
 # Moving Unit Runtime
 
+<img src="media/icon.png" alt="Moving Unit Runtime icon" width="128" height="128">
+
 Shared clocks, spatial queries and host-authoritative unit sessions.
 
 ## Install
