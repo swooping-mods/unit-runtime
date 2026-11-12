@@ -24,6 +24,8 @@ static SURoot unit_world;
 static PTR unit_world_field,unit_restoring,unit_frame,unit_real_delta;
 static DWORD unit_thread,unit_registration_thread;
 static int unit_authoritative,unit_suspended,unit_started;
+static int unit_world_joined;
+static U64 unit_world_local,unit_world_host;
 static U64 unit_session,unit_sequence,unit_frame_seen;
 static float unit_send_time,unit_hello_time;
 static float unit_stats_time,unit_hello_age,unit_snapshot_age;
@@ -114,13 +116,26 @@ static unsigned unit_source_count(unsigned provider){
     if(!unit_main()||unit_suspended||provider>MU_PROVIDER_MAX)return 0;
     return !provider?unit_modded_live:provider==1?unit_native_live:unit_modded_counts[provider-1];
 }
-static int unit_suspend(void){
+static int unit_suspend_session(const char *reason){
     if(!unit_main())return 0;
     if(unit_suspended)return 1;
     unit_suspended=1;unit_replica.suspended=1;
     for(unsigned i=0;i<MU_PROVIDER_MAX;i++)if(unit_provider_live(i))unit_providers[i].reset();
     mu_zero(&unit_registry,sizeof(unit_registry));unit_native_live=unit_modded_live=0;mu_zero(unit_modded_counts,sizeof(unit_modded_counts));
-    event("query-source-suspended-rejoin-required");return 1;
+    event(reason);return 1;
+}
+static int unit_suspend(void){return unit_suspend_session("query-source-suspended-rejoin-required");}
+/* A loaded world's role is immutable. A temporary loss of crew/local identity
+ * cannot turn an online host into an offline host or transfer pending commands
+ * to another local account. Reentry establishes a fresh session instead. */
+static int unit_authority_current(void){
+    if(unit_suspended||!unit_world)return 0;
+    int joined=st_joined();
+    if(joined!=unit_world_joined||(joined&&
+       (st_local_id()!=unit_world_local||st_host_id()!=unit_world_host))){
+        unit_suspend_session("authority-changed-rejoin-required");return 0;
+    }
+    return 1;
 }
 static const MoonUnitSources unit_sources_api={sizeof(MoonUnitSources),MU_SOURCES_ABI,unit_register_source,unit_source_world,unit_main,unit_source_count,unit_suspend};
 __declspec(dllexport) const MoonUnitSources *MoonLab_UnitSources_v1(unsigned abi,unsigned size){
@@ -130,6 +145,7 @@ static void unit_reset(void){
     for(unsigned i=0;i<MU_PROVIDER_MAX;i++)if(unit_provider_live(i))unit_providers[i].reset();
     su_drop(&unit_world);mu_zero(&unit_registry,sizeof(unit_registry));unit_native_live=unit_modded_live=0;mu_zero(unit_modded_counts,sizeof(unit_modded_counts));mu_zero(unit_clocks,sizeof(unit_clocks));
     mu_zero(&unit_replica,sizeof(unit_replica));unit_session=unit_sequence=unit_frame_seen=0;unit_authoritative=unit_suspended=0;
+    unit_world_joined=0;unit_world_local=unit_world_host=0;
     mu_zero(unit_peers,sizeof(unit_peers));mu_zero(unit_pending,sizeof(unit_pending));
     unit_send_time=unit_hello_time=0;
     unit_stats_time=unit_hello_age=unit_snapshot_age=0;unit_rtt_ms=0;unit_commands_applied=unit_commands_replayed=0;
@@ -171,22 +187,19 @@ static void unit_network_stats(float dt){
     p=cat(p,",\"commands_applied\":");p=num(p,unit_commands_applied);p=cat(p,",\"commands_replayed\":");p=num(p,unit_commands_replayed);p=cat(p,"}\n");DWORD n;WriteFile(unit_log,b,(DWORD)(p-b),&n,0);FlushFileBuffers(unit_log);
 }
 static void unit_network(float dt){
-    U64 host=st_host_id(),local=st_local_id();int joined=st_joined();
+    if(!unit_authority_current())return;
+    int joined=unit_world_joined;
+    unit_network_stats(dt);st_receive(unit_receive,0);
     if(unit_suspended)return;
-    if((unit_authoritative&&joined&&(!local||host!=local))||(!unit_authoritative&&(!joined||host!=unit_replica.host))){
-        unit_suspended=1;unit_replica.suspended=1;
-        for(unsigned i=0;i<MU_PROVIDER_MAX;i++)if(unit_provider_live(i))unit_providers[i].reset();
-        event("authority-changed-rejoin-required");return;
-    }
-    unit_network_stats(dt);st_receive(unit_receive,0);unit_send_time-=dt;unit_hello_time-=dt;
+    unit_send_time-=dt;unit_hello_time-=dt;
     if(unit_authoritative){
         for(unsigned i=0;i<ST_BATCH;i++){unit_peers[i].ttl-=dt;if(unit_peers[i].ttl<0)unit_peers[i].ttl=0;}
         if(unit_send_time>0||!joined)return;unit_send_time=.1f;
         unsigned count=0;for(unsigned i=0;i<ST_BATCH;i++)if(unit_peers[i].ttl>0&&st_member(unit_peers[i].id))count++;if(!count)return;
         for(unsigned i=0;i<MU_PROVIDER_MAX;i++)if(unit_provider_live(i)){
             unsigned char payload[MU_PAYLOAD_MAX],packet[MUP_MAX];
-            unsigned n=unit_providers[i].snapshot(payload,sizeof(payload));if(!n||n>sizeof(payload))continue;
-            if(unit_sequence==~(U64)0){unit_suspended=1;event("sequence-exhausted");return;}
+            unsigned n=unit_providers[i].snapshot(payload,sizeof(payload));if(unit_suspended)return;if(!n||n>sizeof(payload))continue;
+            if(unit_sequence==~(U64)0){unit_suspend_session("sequence-exhausted");return;}
             unsigned bytes=mup_write(packet,sizeof(packet),MUP_SNAPSHOT,i+1,unit_session,++unit_sequence,0,payload,n);
             for(unsigned peer=0;peer<ST_BATCH;peer++)if(unit_peers[peer].ttl>0)st_send_mode(unit_peers[peer].id,packet,bytes,0);
         }
@@ -219,9 +232,10 @@ static int unit_before(int id,Context *context){
     int frame=integer(unit_frame,0,&ok);if(!ok||frame<0)return 0;
     if(unit_world&&unit_frame_seen==(U64)frame)return 0;
     if(!unit_world){
-        if(st_joined()&&(!st_local_id()||!st_host_id()))return 0;
+        int joined=st_joined();U64 local=st_local_id(),host=st_host_id();
+        if(joined&&(!local||!host))return 0;
         unit_world=su_hold(world);if(!unit_world)return 0;
-        U64 local=st_local_id(),host=st_host_id();int joined=st_joined();
+        unit_world_joined=joined;unit_world_local=local;unit_world_host=host;
         unit_authoritative=!joined||(local&&host==local);
         if(unit_authoritative)unit_session=unit_nonce();else {unit_replica.host=host;unit_replica.nonce=unit_nonce();}
         event(unit_authoritative?"world-host":"world-guest");
@@ -229,7 +243,9 @@ static int unit_before(int id,Context *context){
     unit_frame_seen=(U64)frame;
     /* Session liveness uses real frame time even when the scene is paused.
      * Simulation providers retain their own scaled logical clocks. */
-    float dt=su_number(unit_real_delta,0);if(mu_finite(dt)&&dt>0){if(dt>10)dt=10;unit_network(dt);}
+    float dt=su_number(unit_real_delta,0);if(!mu_finite(dt)||dt<0)dt=0;if(dt>10)dt=10;
+    /* Even a zero/invalid clock must revoke authority before provider frames. */
+    unit_network(dt);
     unit_provider_frames((PTR)context->rcx);return 0;
 }
 #endif
